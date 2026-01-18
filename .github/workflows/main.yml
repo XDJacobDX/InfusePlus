@@ -29,10 +29,10 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
-    
+
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4.1.1
+        uses: actions/checkout@v4
         with:
           path: main
           submodules: recursive
@@ -44,17 +44,27 @@ jobs:
 
       - name: Validate IPA URL
         run: |
-          curl -L -r 0-1023 -o sample.part "${{ inputs.ipa_url }}" > /dev/null 2>&1
-          file_type=$(file --mime-type -b sample.part)
-          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
-            echo "::error::Validation failed: The file is not a valid IPA file. Detected type: $file_type."
-            exit 1
+          if [ -z "${{ inputs.ipa_url }}" ]; then
+            echo "::warning::No ipa_url provided. You can still run a build to produce a .deb, but no IPA will be generated."
+          else
+            # Download first 1KB to check file signature
+            curl -L -r 0-1023 -o sample.part "${{ inputs.ipa_url }}" > /dev/null 2>&1 || true
+            if [ -f sample.part ]; then
+              file_type=$(file --mime-type -b sample.part)
+              # Check for zip (IPA is a zip) or octet-stream (common for direct downloads)
+              if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" && "$file_type" != "application/octet-stream" ]]; then
+                echo "::error::Validation failed: The file is not a valid IPA/Zip file. Detected type: $file_type."
+                rm sample.part || true
+                exit 1
+              fi
+              rm sample.part
+            fi
           fi
-          rm sample.part
 
       - name: Install Build Dependencies
         run: |
-          brew install make ldid dpkg
+          brew update
+          brew install make ldid dpkg wget unzip
 
       - name: Set PATH for GNU Make
         run: echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
@@ -64,178 +74,183 @@ jobs:
           export THEOS=$HOME/theos
           echo "THEOS=$THEOS" >> $GITHUB_ENV
           
-          # Clone Theos
-          git clone --recursive https://github.com/theos/theos.git $THEOS
-          
-          # Download iOS SDK
-          curl -LO https://github.com/theos/sdks/archive/master.zip
-          unzip -q master.zip
-          mv sdks-master/* $THEOS/sdks/
-          rm -rf sdks-master master.zip
+          if [ -d "$THEOS" ]; then
+            echo "Using existing THEOS at $THEOS"
+          else
+            git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          fi
 
-      - name: Build Tweak from Source
+          # Download iOS SDK collection for Theos if not present
+          if [ ! -d "$THEOS/sdks" ] || [ -z "$(ls -A $THEOS/sdks 2>/dev/null)" ]; then
+            echo "Downloading iOS SDKs..."
+            curl -L https://github.com/theos/sdks/archive/master.zip -o sdks.zip
+            unzip -q sdks.zip
+            mkdir -p "$THEOS/sdks"
+            mv sdks-master/* "$THEOS/sdks/"
+            rm -rf sdks-master sdks.zip
+          else
+            echo "Theos sdks already present"
+          fi
+
+      - name: Install Pyzule (Cyan)
+        run: |
+          python3 -m pip install --upgrade --user pipx
+          python3 -m pipx ensurepath
+          
+          # Manually add pipx bin to PATH for this session
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          
+          # Install pyzule (force to ensure clean install on runner)
+          pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      - name: Build Tweak
         working-directory: main
         run: |
           export THEOS=$HOME/theos
           
-          # Clean any previous builds
-          make clean || true
-          
-          # Build the package
-          make package FINALPACKAGE=1
-          
-          echo "Build complete! Package created."
-          ls -la packages/
+          # 1. Ensure control file exists
+          if [ ! -f ./layout/DEBIAN/control ]; then
+            mkdir -p ./layout/DEBIAN
+            cat > ./layout/DEBIAN/control <<'CONTROL_EOF'
+          Package: com.xdjacobdx.infuseplus
+          Name: InfusePlus
+          Version: 0.0.1-1
+          Section: Tweaks
+          Priority: optional
+          Architecture: iphoneos-arm64
+          Maintainer: GitHub Actions
+          Depends: mobilesubstrate (>= 0)
+          Provides: infuseplus
+          Description: InfusePlus — tweak to alter Infuse video playback.
+          CONTROL_EOF
+            echo "Created layout/DEBIAN/control"
+          fi
 
-      - name: Extract Built DEB
+          # 2. Ensure Filter.plist exists
+          if [ ! -f ./layout/DEBIAN/com.xdjacobdx.infuseplus.plist ]; then
+            # Note: Theos usually handles filters via the Makefile, but if manually placing:
+            cat > ./Filter.plist <<FILTER_EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>Filter</key>
+            <dict>
+              <key>Bundles</key>
+              <array>
+                <string>${{ inputs.bundle_id }}</string>
+              </array>
+            </dict>
+          </dict>
+          </plist>
+          FILTER_EOF
+          fi
+
+          # 3. Build
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Prepare Injection Artifacts
+        id: prepare_artifacts
         working-directory: main
         run: |
-          # Create extraction directory
           mkdir -p tweak_output
           
-          # Find and extract the .deb file
+          # Find the built DEB
           DEB_FILE=$(find packages -name "*.deb" | head -n 1)
-          
           if [ -z "$DEB_FILE" ]; then
-            echo "::error::No .deb file found in packages/"
+            echo "::error::Build failed: No .deb file found in packages/"
             exit 1
           fi
           
-          echo "Found DEB: $DEB_FILE"
+          echo "Extracting $DEB_FILE..."
           dpkg-deb -x "$DEB_FILE" tweak_output/
           
-          # Find the dylib
+          # Find the Dylib
           DYLIB=$(find tweak_output -name "*.dylib" | head -n 1)
-          
           if [ -z "$DYLIB" ]; then
-            echo "::error::No .dylib found in extracted DEB"
+            echo "::error::Extraction failed: No .dylib found."
             exit 1
           fi
           
-          echo "Found dylib: $DYLIB"
           echo "DYLIB_PATH=$DYLIB" >> $GITHUB_ENV
-          
-          # Also copy the bundle if it exists
-          if [ -d "InfusePlus.bundle" ]; then
-            cp -r InfusePlus.bundle tweak_output/
-            echo "Bundle copied"
-          fi
+          echo "Dylib found at: $DYLIB"
 
-      - name: Install Pyzule (cyan)
+      - name: Download and Patch IPA
+        if: ${{ inputs.ipa_url != '' }}
         run: |
-          pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
-
-      - name: Download Decrypted IPA
-        run: |
+          # 1. Download IPA
+          echo "Downloading IPA..."
           wget "${{ inputs.ipa_url }}" --no-verbose -O infuse.ipa
           
           if [ ! -f "infuse.ipa" ]; then
-            echo "::error::Failed to download IPA"
+            echo "::error::Failed to download IPA."
             exit 1
           fi
-          
-          echo "IPA downloaded successfully"
-          ls -lh infuse.ipa
 
-      - name: Inject Fixed Tweak into IPA
-        run: |
-          # Create a temporary deb-like structure for cyan
+          # 2. Prepare Fake DEB structure for Cyan
+          # We need to construct a specific folder structure for Cyan to inject
           mkdir -p fake_deb/Library/MobileSubstrate/DynamicLibraries
           
-          # Copy the dylib
-          cp "${{ env.DYLIB_PATH }}" fake_deb/Library/MobileSubstrate/DynamicLibraries/
+          # Copy Dylib (Variable set in previous step points to main/tweak_output/...)
+          cp "main/${{ env.DYLIB_PATH }}" fake_deb/Library/MobileSubstrate/DynamicLibraries/
           
-          # Copy the bundle if it exists
+          # Copy Bundle (Check multiple locations)
           if [ -d "main/tweak_output/InfusePlus.bundle" ]; then
-            cp -r main/tweak_output/InfusePlus.bundle fake_deb/Library/MobileSubstrate/DynamicLibraries/
+            cp -r "main/tweak_output/InfusePlus.bundle" fake_deb/Library/MobileSubstrate/DynamicLibraries/
           elif [ -d "main/InfusePlus.bundle" ]; then
-            cp -r main/InfusePlus.bundle fake_deb/Library/MobileSubstrate/DynamicLibraries/
+            cp -r "main/InfusePlus.bundle" fake_deb/Library/MobileSubstrate/DynamicLibraries/
           fi
           
-          # Create a simple deb
+          # Create Control file for injection package
           mkdir -p fake_deb/DEBIAN
-          cat > fake_deb/DEBIAN/control << EOF
+          cat > fake_deb/DEBIAN/control <<'DEBCTR'
           Package: com.infuseplus.fixed
           Name: InfusePlus Fixed
           Version: 1.0.0
           Architecture: iphoneos-arm64
-          Description: InfusePlus iOS 26.2 Compatible
           Maintainer: GitHub Actions
-          Author: Fixed Build
+          Description: Injection Package
           Section: Tweaks
-          EOF
-          
+          DEBCTR
+
+          # Build the injection DEB
           dpkg-deb -b fake_deb infuseplus_fixed.deb
+
+          # 3. Inject using Cyan
+          # Ensure cyan is in path
+          export PATH="$HOME/.local/bin:$PATH"
           
-          # Inject using cyan
+          echo "Running Cyan Injection..."
           cyan -i infuse.ipa \
-               -o InfusePlus_Fixed_iOS26.ipa \
-               -uwef infuseplus_fixed.deb \
+               -o InfusePlus_Fixed.ipa \
+               -u -w -e -f \
+               --tweak infuseplus_fixed.deb \
                -n "${{ inputs.display_name }}" \
                -b "${{ inputs.bundle_id }}"
-          
-          if [ ! -f "InfusePlus_Fixed_iOS26.ipa" ]; then
-            echo "::error::Failed to create final IPA"
+
+          if [ ! -f "InfusePlus_Fixed.ipa" ]; then
+            echo "::error::Cyan failed to produce an output IPA."
             exit 1
           fi
           
-          echo "Final IPA created successfully!"
-          ls -lh InfusePlus_Fixed_iOS26.ipa
+          echo "::notice::IPA Created: InfusePlus_Fixed.ipa"
 
-      - name: Upload to GitHub Releases
-        uses: softprops/action-gh-release@v2.0.1
+      - name: Upload Release
+        if: ${{ inputs.ipa_url != '' }}
+        uses: softprops/action-gh-release@v2
         with:
           name: "InfusePlus Fixed - iOS 26.2 (Build ${{ github.run_number }})"
-          tag_name: "fixed-build-${{ github.run_number }}"
-          files: InfusePlus_Fixed_iOS26.ipa
-          draft: false
+          tag_name: "build-${{ github.run_number }}"
+          files: InfusePlus_Fixed.ipa
           body: |
-            ## ✅ InfusePlus - iOS 26.2 Compatible Build
+            ## InfusePlus (iOS 26.2 Compatible)
             
-            **Build Number:** ${{ github.run_number }}
-            **Built from source** using the fixed `Tweak.x` in this repository
+            **Build:** ${{ github.run_number }}
+            **Bundle ID:** `${{ inputs.bundle_id }}`
             
-            ### What's Fixed:
-            - ✅ **transitionDidFinish crash** - No more SIGABRT on video playback
-            - ✅ **Black screen fix** - Videos play properly now
-            - ✅ **Premium features** - All pro features unlocked
-            - ✅ **Background playback** - Enabled by default
-            - ✅ **Ad removal** - All ads blocked
-            - ✅ **iOS 26.2 compatible** - Tested and working
-            
-            ### Installation:
-            1. Download `InfusePlus_Fixed_iOS26.ipa` below
-            2. Install using:
-               - **AltStore** (recommended)
-               - **Sideloadly** 
-               - **TrollStore** (if jailbroken)
-            3. Trust the certificate: Settings → General → VPN & Device Management
-            4. Launch Infuse and test video playback
-            
-            ### First-Time Setup:
-            - Open Infuse
-            - Go to Settings → Playback
-            - **Disable "Dolby Vision"** if you have issues
-            - Test with a local video file first
-            
-            ### Troubleshooting:
-            - **App crashes on launch:** Re-sign with your own certificate
-            - **Black screen still appears:** Disable hardware acceleration in settings
-            - **Premium features not working:** Wait 30 seconds after first launch
-            - **Videos won't play:** Check file format compatibility
-            
-            ### Technical Details:
-            - **Bundle ID:** ${{ inputs.bundle_id }}
-            - **Display Name:** ${{ inputs.display_name }}
-            - **iOS Compatibility:** iOS 14.0 - iOS 26.2+
-            - **Architecture:** arm64, arm64e
-            
-            ---
-            
-            **Report issues:** Open an issue in this repository with crash logs
-            **Need help?** Check the README for detailed troubleshooting
-
-      - name: Output Release URL
-        run: |
-          echo "::notice::✅ Build Complete! Release available at: https://github.com/${{ github.repository }}/releases"
-          echo "::notice::Download your fixed IPA from the releases page"
+            ### Improvements
+            - Fixed `transitionDidFinish` crash
+            - Fixed Black screen issues
+            - Pro features unlocked
