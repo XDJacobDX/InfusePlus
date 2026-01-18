@@ -100,7 +100,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build Tweak
+      - name: Build Tweak (arm64 only)
         working-directory: main
         run: |
           export THEOS="$HOME/theos"
@@ -142,8 +142,9 @@ jobs:
           fi
 
           # 3. Compile
+          # IMPORTANT: Forced ARCHS=arm64 to prevent crash on non-jailbroken devices
           make clean
-          make package FINALPACKAGE=1
+          make package FINALPACKAGE=1 ARCHS=arm64
 
       - name: Prepare Injection Artifacts
         working-directory: main
@@ -168,7 +169,6 @@ jobs:
         if: ${{ inputs.ipa_url != '' }}
         run: |
           # 1. Download
-          # --no-verbose stops the progress bar from spamming logs
           wget --no-verbose "${{ inputs.ipa_url }}" -O infuse.ipa
           
           if [ ! -f infuse.ipa ]; then
@@ -204,11 +204,7 @@ jobs:
           # 3. Inject
           export PATH="$HOME/.local/bin:$PATH"
           
-          echo "Files available for injection:"
-          ls -la infuse.ipa infuseplus_fixed.deb
-          
           echo "Injecting..."
-          # Running as single line to avoid parsing errors
           cyan -i infuse.ipa -o InfusePlus_Fixed.ipa -u -w -e -n "${{ inputs.display_name }}" -b "${{ inputs.bundle_id }}" -f infuseplus_fixed.deb
 
           if [ ! -f InfusePlus_Fixed.ipa ]; then
@@ -228,3 +224,4 @@ jobs:
           body: |
             ## InfusePlus Build ${{ github.run_number }}
             **Bundle ID:** ${{ inputs.bundle_id }}
+            **Architecture:** arm64 (Sideload Fixed)
