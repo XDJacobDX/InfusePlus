@@ -31,50 +31,55 @@ jobs:
       contents: write
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4.1.1
+      - name: Checkout Repository
+        uses: actions/checkout@v4
         with:
           path: main
           submodules: recursive
 
-      - name: Hide sensitive inputs
+      - name: Hide Sensitive Inputs
         uses: levibostian/action-hide-sensitive-inputs@v1
         with:
           exclude_inputs: display_name,bundle_id
 
-      - name: Validate IPA URL (optional)
+      - name: Validate IPA URL
         run: |
           if [ -z "${{ inputs.ipa_url }}" ]; then
-            echo "No ipa_url provided; workflow will build .deb only."
+            echo "::warning::No ipa_url provided. Workflow will build .deb only."
             exit 0
           fi
-          curl -L -r 0-1023 -o sample.part "${{ inputs.ipa_url }}" || true
+          
+          # Download first 1KB to check file signature
+          curl -L -r 0-1023 -o sample.part "${{ inputs.ipa_url }}"
+          
           if [ -f sample.part ]; then
             file_type=$(file --mime-type -b sample.part)
             rm -f sample.part
-            if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            # Allow zip, x-ios-app, or octet-stream (common for some hosting)
+            if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" && "$file_type" != "application/octet-stream" ]]; then
               echo "::error::Validation failed: The file is not a valid IPA. Detected type: $file_type"
               exit 1
             fi
           else
-            echo "::warning::Could not download sample 1KB from IPA URL; continuing (runner network may block partial range)."
+            echo "::warning::Could not download sample from IPA URL; continuing (runner network may block partial range)."
           fi
 
-      - name: Install system build deps (Homebrew)
+      - name: Install System Dependencies
         run: |
-          brew update || true
-          brew install make ldid dpkg wget unzip pipx || true
-          # Ensure GNU make path (Homebrew note)
+          brew update
+          # Install pipx via brew to avoid PEP 668 errors
+          brew install make ldid dpkg wget unzip pipx
+          
+          # Add Homebrew and pipx bin paths to GITHUB_PATH for subsequent steps
           echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
-          # Make sure Homebrew bin is available
           echo "/opt/homebrew/bin" >> $GITHUB_PATH
-          # Ensure pipx shims will be added for this job
           echo "$HOME/.local/bin" >> $GITHUB_PATH
 
-      - name: Setup THEOS and iOS sdks
+      - name: Setup Theos
         run: |
           export THEOS="$HOME/theos"
           echo "THEOS=$THEOS" >> $GITHUB_ENV
+          
           if [ -d "$THEOS" ]; then
             echo "Using existing THEOS at $THEOS"
           else
@@ -82,205 +87,180 @@ jobs:
           fi
 
           if [ ! -d "$THEOS/sdks" ] || [ -z "$(ls -A $THEOS/sdks 2>/dev/null)" ]; then
-            curl -LO https://github.com/theos/sdks/archive/master.zip
-            unzip -q master.zip
+            echo "Downloading iOS SDKs..."
+            curl -L -o sdks.zip https://github.com/theos/sdks/archive/master.zip
+            unzip -q sdks.zip
             mkdir -p "$THEOS/sdks"
             mv sdks-master/* "$THEOS/sdks/"
-            rm -rf sdks-master master.zip
+            rm -rf sdks-master sdks.zip
           else
-            echo "THEOS sdks present"
+            echo "Theos SDKs already present"
           fi
 
-      - name: Install pyzule (cyan) with pipx and verify
-        env:
-          PATH: ${{ github.runner.temp }}/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH
+      - name: Install Pyzule (Cyan)
         run: |
-          # pipx installed via Homebrew; ensure it's available
+          # Verify pipx is installed
           if ! command -v pipx >/dev/null 2>&1; then
-            echo "::error::pipx command not found after brew install. PATH: $PATH"
-            ls -la /opt/homebrew/bin || true
+            echo "::error::pipx not found. Homebrew installation failed."
             exit 1
           fi
-          # Ensure pipx will create shims in ~/.local/bin
-          pipx ensurepath || true
-          export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
-          # Install pyzule (which provides cyan). Force reinstall to ensure runner has it.
-          pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip || true
-          # Verify cyan is on PATH
+          
+          # Ensure pipx paths are set up
+          pipx ensurepath
+          
+          # Manually export PATH for this specific run step as well
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          # Install pyzule
+          pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+          
+          # Verify cyan
           if ! command -v cyan >/dev/null 2>&1; then
-            echo "::error::cyan not found after pipx install. Listing $HOME/.local/bin:"
-            ls -la "$HOME/.local/bin" || true
+            echo "::error::cyan not found after install."
+            ls -la "$HOME/.local/bin"
             exit 1
           fi
-          cyan --version || true
-          echo "cyan available"
+          echo "Pyzule (Cyan) installed successfully."
 
-      - name: Ensure packaging metadata exists and build tweak
+      - name: Build Tweak
         working-directory: main
-        env:
-          THEOS: ${{ env.THEOS }}
-          BUNDLE_ID: ${{ inputs.bundle_id }}
-          DISPLAY_NAME: ${{ inputs.display_name }}
         run: |
           export THEOS="$HOME/theos"
-          echo "THEOS=$THEOS" >> $GITHUB_ENV
-          # Create control if missing
-          if [ ! -f ./control ] && [ ! -f ./layout/DEBIAN/control ]; then
+          
+          # 1. Create Control File
+          if [ ! -f ./layout/DEBIAN/control ]; then
             mkdir -p ./layout/DEBIAN
-            cat > ./layout/DEBIAN/control <<'CONTROL'
-Package: com.xdjacobdx.infuseplus
-Name: InfusePlus
-Version: 0.0.1-1
-Section: Tweaks
-Priority: optional
-Architecture: iphoneos-arm64
-Maintainer: Jacob Monroe <youremail@example.com>
-Depends: mobilesubstrate (>= 0)
-Provides: infuseplus
-Description: InfusePlus — tweak to alter Infuse video playback. Built from XDJacobDX/InfusePlus.
-CONTROL
+            cat > ./layout/DEBIAN/control <<'CONTROL_EOF'
+          Package: com.xdjacobdx.infuseplus
+          Name: InfusePlus
+          Version: 0.0.1-1
+          Section: Tweaks
+          Priority: optional
+          Architecture: iphoneos-arm64
+          Maintainer: GitHub Actions
+          Depends: mobilesubstrate (>= 0)
+          Provides: infuseplus
+          Description: InfusePlus — tweak to alter Infuse video playback.
+          CONTROL_EOF
             echo "Created layout/DEBIAN/control"
-          else
-            echo "control already exists"
           fi
 
-          # Create Filter.plist with correct bundle/executable names
-          if [ ! -f ./Filter.plist ] && [ ! -f ./InfusePlus.plist ]; then
-            cat > ./Filter.plist <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Filter</key>
-  <dict>
-    <key>Bundles</key>
-    <array>
-      <string>${BUNDLE_ID}</string>
-    </array>
-    <key>Executables</key>
-    <array>
-      <string>${DISPLAY_NAME}</string>
-    </array>
-    <key>Mode</key>
-    <string>Any</string>
-  </dict>
-</dict>
-</plist>
-PLIST
-            echo "Created Filter.plist"
-          else
-            echo "Filter.plist exists"
+          # 2. Create Filter.plist
+          if [ ! -f ./Filter.plist ]; then
+            cat > ./Filter.plist <<FILTER_EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>Filter</key>
+            <dict>
+              <key>Bundles</key>
+              <array>
+                <string>${{ inputs.bundle_id }}</string>
+              </array>
+              <key>Executables</key>
+              <array>
+                <string>${{ inputs.display_name }}</string>
+              </array>
+            </dict>
+          </dict>
+          </plist>
+          FILTER_EOF
           fi
 
-          echo "Contents of main/ before build:"
-          ls -la
-
-          # Build with Theos (clean first)
-          make clean || true
+          # 3. Compile
+          echo "Starting Build..."
+          make clean
           make package FINALPACKAGE=1
 
-          echo "Build attempted. packages/ content:"
-          ls -la packages || true
-
-      - name: Extract built .deb and prepare tweak_output
+      - name: Prepare Injection Artifacts
         working-directory: main
         run: |
           mkdir -p tweak_output
-          DEB_FILE=$(find packages -name "*.deb" | head -n 1 || true)
+          DEB_FILE=$(find packages -name "*.deb" | head -n 1)
+          
           if [ -z "$DEB_FILE" ]; then
-            echo "::error::No .deb found in packages/ — build likely failed before packaging."
-            ls -la packages || true
+            echo "::error::No .deb file found. Build failed."
             exit 1
           fi
-          echo "Found DEB: $DEB_FILE"
+          
+          echo "Extracting DEB: $DEB_FILE"
           dpkg-deb -x "$DEB_FILE" tweak_output/
-          DYLIB=$(find tweak_output -name "*.dylib" | head -n 1 || true)
+          
+          DYLIB=$(find tweak_output -name "*.dylib" | head -n 1)
           if [ -z "$DYLIB" ]; then
-            echo "::error::No .dylib found in extracted DEB"
-            find tweak_output -maxdepth 4 -type f -print || true
+            echo "::error::No .dylib found in extracted DEB."
             exit 1
           fi
-          echo "Found dylib: $DYLIB"
+          
+          # Export path for next steps
           echo "DYLIB_PATH=$DYLIB" >> $GITHUB_ENV
+          echo "Found Dylib: $DYLIB"
 
-      - name: Download decrypted IPA (if provided)
+      - name: Download and Patch IPA
+        if: ${{ inputs.ipa_url != '' }}
         run: |
-          if [ -z "${{ inputs.ipa_url }}" ]; then
-            echo "No ipa_url provided; skipping IPA download/injection"
-            exit 0
-          fi
-          wget "${{ inputs.ipa_url }}" -O infuse.ipa || true
+          # 1. Download
+          wget "${{ inputs.ipa_url }}" -O infuse.ipa
           if [ ! -f infuse.ipa ]; then
             echo "::error::Failed to download IPA"
             exit 1
           fi
-          echo "IPA downloaded"
 
-      - name: Create fake .deb and inject tweak into IPA with cyan
-        if: ${{ inputs.ipa_url != '' }}
-        env:
-          PATH: $HOME/.local/bin:/opt/homebrew/bin:$PATH
-        run: |
-          if [ -z "${DYLIB_PATH}" ] && [ -z "${{ env.DYLIB_PATH }}" ]; then
-            echo "::error::DYLIB path not set; extraction failed earlier"
-            exit 1
-          fi
-          # Resolve DYLIB path from env (set by previous step)
-          DYL="${DYLIB_PATH:-${{ env.DYLIB_PATH }}}"
+          # 2. Prepare Fake DEB for Cyan
+          # We need the path relative to the root, combined with the 'main' directory
+          FULL_DYLIB_PATH="main/${{ env.DYLIB_PATH }}"
+          
           mkdir -p fake_deb/Library/MobileSubstrate/DynamicLibraries
-          cp "$DYL" fake_deb/Library/MobileSubstrate/DynamicLibraries/ || true
+          cp "$FULL_DYLIB_PATH" fake_deb/Library/MobileSubstrate/DynamicLibraries/
 
-          # Copy bundle if present
+          # Check for bundle
           if [ -d "main/tweak_output/InfusePlus.bundle" ]; then
-            cp -r main/tweak_output/InfusePlus.bundle fake_deb/Library/MobileSubstrate/DynamicLibraries/ || true
+            cp -r "main/tweak_output/InfusePlus.bundle" fake_deb/Library/MobileSubstrate/DynamicLibraries/
           elif [ -d "main/InfusePlus.bundle" ]; then
-            cp -r main/InfusePlus.bundle fake_deb/Library/MobileSubstrate/DynamicLibraries/ || true
+            cp -r "main/InfusePlus.bundle" fake_deb/Library/MobileSubstrate/DynamicLibraries/
           fi
 
+          # Create Fake Control
           mkdir -p fake_deb/DEBIAN
-          cat > fake_deb/DEBIAN/control <<'DEB'
-Package: com.infuseplus.fixed
-Name: InfusePlus Fixed
-Version: 1.0.0
-Architecture: iphoneos-arm64
-Maintainer: GitHub Actions
-Description: Temporary package containing InfusePlus tweak artifacts for injection
-Section: Tweaks
-DEB
+          cat > fake_deb/DEBIAN/control <<'DEB_CTR'
+          Package: com.infuseplus.fixed
+          Name: InfusePlus Fixed
+          Version: 1.0.0
+          Architecture: iphoneos-arm64
+          Maintainer: GitHub Actions
+          Description: Injection Package
+          Section: Tweaks
+          DEB_CTR
 
-          dpkg-deb -b fake_deb infuseplus_fixed.deb || true
+          dpkg-deb -b fake_deb infuseplus_fixed.deb
 
-          # Ensure cyan binary is available
-          if ! command -v cyan >/dev/null 2>&1; then
-            echo "::error::cyan not found in PATH. Make sure pipx installed pyzule earlier."
-            exit 1
-          fi
-
+          # 3. Inject
+          export PATH="$HOME/.local/bin:$PATH"
+          
+          echo "Injecting..."
           cyan -i infuse.ipa \
-               -o InfusePlus_Fixed_iOS26.ipa \
-               -uwef infuseplus_fixed.deb \
+               -o InfusePlus_Fixed.ipa \
+               -u -w -e -f \
+               --tweak infuseplus_fixed.deb \
                -n "${{ inputs.display_name }}" \
-               -b "${{ inputs.bundle_id }}" || true
+               -b "${{ inputs.bundle_id }}"
 
-          if [ ! -f InfusePlus_Fixed_iOS26.ipa ]; then
-            echo "::error::Failed to create final patched IPA"
-            ls -la
+          if [ ! -f InfusePlus_Fixed.ipa ]; then
+            echo "::error::Cyan failed to create IPA"
             exit 1
           fi
-          echo "Patched IPA created: InfusePlus_Fixed_iOS26.ipa"
-          ls -lh InfusePlus_Fixed_iOS26.ipa
+          echo "Success: InfusePlus_Fixed.ipa created."
 
-      - name: Upload patched IPA to GitHub Releases
+      - name: Upload to Releases
         if: ${{ inputs.ipa_url != '' }}
-        uses: softprops/action-gh-release@v2.0.1
+        uses: softprops/action-gh-release@v2
         with:
           name: "InfusePlus Fixed - iOS 26.2 (Build ${{ github.run_number }})"
-          tag_name: "fixed-build-${{ github.run_number }}"
-          files: InfusePlus_Fixed_iOS26.ipa
+          tag_name: "build-${{ github.run_number }}"
+          files: InfusePlus_Fixed.ipa
           draft: false
           body: |
-            InfusePlus Fixed - built from source by GitHub Actions
-
-      - name: Finished
-        run: echo "Workflow finished. Check Actions logs and Releases for artifacts."
+            ## InfusePlus Build ${{ github.run_number }}
+            **Bundle ID:** ${{ inputs.bundle_id }}
+            **Status:** iOS 26.2 Fix Applied
