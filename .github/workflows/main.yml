@@ -99,16 +99,8 @@ jobs:
 
       - name: Install Pyzule (Cyan)
         run: |
-          # Verify pipx is installed
-          if ! command -v pipx >/dev/null 2>&1; then
-            echo "::error::pipx not found. Homebrew installation failed."
-            exit 1
-          fi
-          
           # Ensure pipx paths are set up
           pipx ensurepath
-          
-          # Manually export PATH for this specific run step as well
           export PATH="$HOME/.local/bin:$PATH"
           
           # Install pyzule
@@ -200,15 +192,15 @@ jobs:
       - name: Download and Patch IPA
         if: ${{ inputs.ipa_url != '' }}
         run: |
-          # 1. Download
-          wget "${{ inputs.ipa_url }}" -O infuse.ipa
+          # 1. Download (Quietly)
+          wget --no-verbose "${{ inputs.ipa_url }}" -O infuse.ipa
+          
           if [ ! -f infuse.ipa ]; then
             echo "::error::Failed to download IPA"
             exit 1
           fi
 
           # 2. Prepare Fake DEB for Cyan
-          # We need the path relative to the root, combined with the 'main' directory
           FULL_DYLIB_PATH="main/${{ env.DYLIB_PATH }}"
           
           mkdir -p fake_deb/Library/MobileSubstrate/DynamicLibraries
@@ -236,13 +228,19 @@ jobs:
           dpkg-deb -b fake_deb infuseplus_fixed.deb
 
           # 3. Inject
+          # Add cyan to PATH manually for this shell
           export PATH="$HOME/.local/bin:$PATH"
           
           echo "Injecting..."
+          # Flags explanation:
+          # -u: Remove UISupportedDevices
+          # -w: Remove Watch App
+          # -e: Remove Extensions
+          # -f: File to inject (must come immediately before the file name)
           cyan -i infuse.ipa \
                -o InfusePlus_Fixed.ipa \
-               -u -w -e -f \
-               --tweak infuseplus_fixed.deb \
+               -u -w -e \
+               -f infuseplus_fixed.deb \
                -n "${{ inputs.display_name }}" \
                -b "${{ inputs.bundle_id }}"
 
