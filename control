@@ -1,0 +1,10 @@
+Package: com.xdjacobdx.infuseplus
+Name: InfusePlus
+Version: 0.0.1-1
+Section: Tweaks
+Priority: optional
+Architecture: iphoneos-arm64
+Maintainer: Jacob Monroe <youremail@example.com>
+Depends: mobilesubstrate (>= 0)
+Provides: infuseplus
+Description: InfusePlus — tweak to alter Infuse video playback. Built from XDJacobDX/InfusePlus
