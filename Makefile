@@ -4,6 +4,8 @@ ARCHS = arm64 arm64e
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = InfusePlus
+InfusePlus_FRAMEWORKS = UIKit AVFoundation AVKit
+
 
 InfusePlus_FILES = Tweak.x
 InfusePlus_CFLAGS = -fobjc-arc
