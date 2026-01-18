@@ -48,29 +48,23 @@ jobs:
             echo "::warning::No ipa_url provided. Workflow will build .deb only."
             exit 0
           fi
-          
           # Download first 1KB to check file signature
           curl -L -r 0-1023 -o sample.part "${{ inputs.ipa_url }}"
-          
           if [ -f sample.part ]; then
             file_type=$(file --mime-type -b sample.part)
             rm -f sample.part
-            # Allow zip, x-ios-app, or octet-stream (common for some hosting)
             if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" && "$file_type" != "application/octet-stream" ]]; then
               echo "::error::Validation failed: The file is not a valid IPA. Detected type: $file_type"
               exit 1
             fi
-          else
-            echo "::warning::Could not download sample from IPA URL; continuing (runner network may block partial range)."
           fi
 
       - name: Install System Dependencies
         run: |
           brew update
-          # Install pipx via brew to avoid PEP 668 errors
           brew install make ldid dpkg wget unzip pipx
           
-          # Add Homebrew and pipx bin paths to GITHUB_PATH for subsequent steps
+          # Add paths to GITHUB_PATH for subsequent steps
           echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
           echo "/opt/homebrew/bin" >> $GITHUB_PATH
           echo "$HOME/.local/bin" >> $GITHUB_PATH
@@ -93,26 +87,18 @@ jobs:
             mkdir -p "$THEOS/sdks"
             mv sdks-master/* "$THEOS/sdks/"
             rm -rf sdks-master sdks.zip
-          else
-            echo "Theos SDKs already present"
           fi
 
       - name: Install Pyzule (Cyan)
         run: |
-          # Ensure pipx paths are set up
           pipx ensurepath
           export PATH="$HOME/.local/bin:$PATH"
-          
-          # Install pyzule
           pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
           
-          # Verify cyan
           if ! command -v cyan >/dev/null 2>&1; then
             echo "::error::cyan not found after install."
-            ls -la "$HOME/.local/bin"
             exit 1
           fi
-          echo "Pyzule (Cyan) installed successfully."
 
       - name: Build Tweak
         working-directory: main
@@ -134,7 +120,6 @@ jobs:
           Provides: infuseplus
           Description: InfusePlus — tweak to alter Infuse video playback.
           CONTROL_EOF
-            echo "Created layout/DEBIAN/control"
           fi
 
           # 2. Create Filter.plist
@@ -150,10 +135,6 @@ jobs:
               <array>
                 <string>${{ inputs.bundle_id }}</string>
               </array>
-              <key>Executables</key>
-              <array>
-                <string>${{ inputs.display_name }}</string>
-              </array>
             </dict>
           </dict>
           </plist>
@@ -161,7 +142,6 @@ jobs:
           fi
 
           # 3. Compile
-          echo "Starting Build..."
           make clean
           make package FINALPACKAGE=1
 
@@ -170,29 +150,25 @@ jobs:
         run: |
           mkdir -p tweak_output
           DEB_FILE=$(find packages -name "*.deb" | head -n 1)
-          
           if [ -z "$DEB_FILE" ]; then
             echo "::error::No .deb file found. Build failed."
             exit 1
           fi
           
-          echo "Extracting DEB: $DEB_FILE"
           dpkg-deb -x "$DEB_FILE" tweak_output/
-          
           DYLIB=$(find tweak_output -name "*.dylib" | head -n 1)
           if [ -z "$DYLIB" ]; then
             echo "::error::No .dylib found in extracted DEB."
             exit 1
           fi
           
-          # Export path for next steps
           echo "DYLIB_PATH=$DYLIB" >> $GITHUB_ENV
-          echo "Found Dylib: $DYLIB"
 
       - name: Download and Patch IPA
         if: ${{ inputs.ipa_url != '' }}
         run: |
-          # 1. Download (Quietly)
+          # 1. Download
+          # --no-verbose stops the progress bar from spamming logs
           wget --no-verbose "${{ inputs.ipa_url }}" -O infuse.ipa
           
           if [ ! -f infuse.ipa ]; then
@@ -206,14 +182,12 @@ jobs:
           mkdir -p fake_deb/Library/MobileSubstrate/DynamicLibraries
           cp "$FULL_DYLIB_PATH" fake_deb/Library/MobileSubstrate/DynamicLibraries/
 
-          # Check for bundle
           if [ -d "main/tweak_output/InfusePlus.bundle" ]; then
             cp -r "main/tweak_output/InfusePlus.bundle" fake_deb/Library/MobileSubstrate/DynamicLibraries/
           elif [ -d "main/InfusePlus.bundle" ]; then
             cp -r "main/InfusePlus.bundle" fake_deb/Library/MobileSubstrate/DynamicLibraries/
           fi
 
-          # Create Fake Control
           mkdir -p fake_deb/DEBIAN
           cat > fake_deb/DEBIAN/control <<'DEB_CTR'
           Package: com.infuseplus.fixed
@@ -228,21 +202,14 @@ jobs:
           dpkg-deb -b fake_deb infuseplus_fixed.deb
 
           # 3. Inject
-          # Add cyan to PATH manually for this shell
           export PATH="$HOME/.local/bin:$PATH"
           
+          echo "Files available for injection:"
+          ls -la infuse.ipa infuseplus_fixed.deb
+          
           echo "Injecting..."
-          # Flags explanation:
-          # -u: Remove UISupportedDevices
-          # -w: Remove Watch App
-          # -e: Remove Extensions
-          # -f: File to inject (must come immediately before the file name)
-          cyan -i infuse.ipa \
-               -o InfusePlus_Fixed.ipa \
-               -u -w -e \
-               -f infuseplus_fixed.deb \
-               -n "${{ inputs.display_name }}" \
-               -b "${{ inputs.bundle_id }}"
+          # Running as single line to avoid parsing errors
+          cyan -i infuse.ipa -o InfusePlus_Fixed.ipa -u -w -e -n "${{ inputs.display_name }}" -b "${{ inputs.bundle_id }}" -f infuseplus_fixed.deb
 
           if [ ! -f InfusePlus_Fixed.ipa ]; then
             echo "::error::Cyan failed to create IPA"
@@ -261,4 +228,3 @@ jobs:
           body: |
             ## InfusePlus Build ${{ github.run_number }}
             **Bundle ID:** ${{ inputs.bundle_id }}
-            **Status:** iOS 26.2 Fix Applied
