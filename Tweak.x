@@ -6,6 +6,18 @@
 
 #pragma mark - Premium Unlock
 
+@class NSObject; @class AVPlayerViewController; @class UIPresentationController; @class AVAudioSession; @class UIView;
+// Ensure required system headers are available for types and properties used by the tweak
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <AVKit/AVKit.h>
+#import <objc/runtime.h>
+
+// Forward declarations (kept for logos/macros) - actual type info comes from the imports above.
+@class NSObject; @class AVPlayerViewController; @class UIPresentationController; @class AVAudioSession; @class UIView;
+
+
 %hook NSObject
 
 - (BOOL)isPremiumUser {
