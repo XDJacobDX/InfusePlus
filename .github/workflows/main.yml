@@ -64,7 +64,8 @@ jobs:
       - name: Install Build Dependencies
         run: |
           brew update
-          brew install make ldid dpkg wget unzip
+          # Added pipx here to install it via Homebrew (fixes externally-managed-environment error)
+          brew install make ldid dpkg wget unzip pipx
 
       - name: Set PATH for GNU Make
         run: echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
@@ -94,14 +95,11 @@ jobs:
 
       - name: Install Pyzule (Cyan)
         run: |
-          python3 -m pip install --upgrade --user pipx
-          python3 -m pipx ensurepath
-          
-          # Manually add pipx bin to PATH for this session
-          export PATH="$HOME/.local/bin:$PATH"
+          # Ensure pipx bin path is added to PATH (where 'cyan' will be installed)
           echo "$HOME/.local/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.local/bin:$PATH"
           
-          # Install pyzule (force to ensure clean install on runner)
+          # Install pyzule using pipx (which is now installed via brew)
           pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
 
       - name: Build Tweak
@@ -129,7 +127,6 @@ jobs:
 
           # 2. Ensure Filter.plist exists
           if [ ! -f ./layout/DEBIAN/com.xdjacobdx.infuseplus.plist ]; then
-            # Note: Theos usually handles filters via the Makefile, but if manually placing:
             cat > ./Filter.plist <<FILTER_EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -190,7 +187,6 @@ jobs:
           fi
 
           # 2. Prepare Fake DEB structure for Cyan
-          # We need to construct a specific folder structure for Cyan to inject
           mkdir -p fake_deb/Library/MobileSubstrate/DynamicLibraries
           
           # Copy Dylib (Variable set in previous step points to main/tweak_output/...)
@@ -219,7 +215,6 @@ jobs:
           dpkg-deb -b fake_deb infuseplus_fixed.deb
 
           # 3. Inject using Cyan
-          # Ensure cyan is in path
           export PATH="$HOME/.local/bin:$PATH"
           
           echo "Running Cyan Injection..."
